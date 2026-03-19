@@ -1,20 +1,15 @@
 # -*- coding: utf-8 -*-
-# /usr/bin/env/python3
 
-'''
-test pretrained model.
-Author: aiboy.wei@outlook.com .
-'''
+"""
+LPRNet inference / evaluation script.
+
+Supports greedy and beam-search CTC decoding (Sec. 3.1).
+"""
 
 from data.load_data import CHARS, CHARS_DICT, LPRDataLoader
-from PIL import Image, ImageDraw, ImageFont
 from model.LPRNet import build_lprnet
-# import torch.backends.cudnn as cudnn
-from torch.autograd import Variable
+from torch.utils.data import DataLoader
 import torch.nn.functional as F
-from torch.utils.data import *
-from torch import optim
-import torch.nn as nn
 import numpy as np
 import argparse
 import torch
@@ -22,22 +17,135 @@ import time
 import cv2
 import os
 
+
+# ---------------------------------------------------------------------------
+# CTC decoders
+# ---------------------------------------------------------------------------
+
+def greedy_decode(logits, blank):
+    """CTC greedy decoding for a single sample.
+
+    Args:
+        logits: (C, T) raw logits
+        blank:  index of the CTC blank token
+    Returns:
+        list of decoded token indices
+    """
+    indices = logits.argmax(axis=0)
+    collapsed = []
+    prev = -1
+    for idx in indices:
+        if idx != prev:
+            collapsed.append(idx)
+        prev = idx
+    return [c for c in collapsed if c != blank]
+
+
+def beam_search_decode(logits, beam_width=10, blank=0):
+    """CTC prefix beam search for a single sample.
+
+    Tracks (prob_ending_in_blank, prob_ending_in_non_blank) per prefix
+    to correctly handle repeated characters separated by blanks.
+
+    Args:
+        logits:     (C, T) raw logits
+        beam_width: number of hypotheses to keep
+        blank:      index of the CTC blank token
+    Returns:
+        list of decoded token indices for the best beam
+    """
+    C, T = logits.shape
+    log_probs = torch.log_softmax(torch.tensor(logits), dim=0).numpy()
+    NEG_INF = float('-inf')
+
+    # {prefix_tuple: (log_prob_blank, log_prob_non_blank)}
+    beams = {(): (0.0, NEG_INF)}
+
+    for t in range(T):
+        new_beams = {}
+
+        def _add(prefix, pb, pnb):
+            if prefix in new_beams:
+                opb, opnb = new_beams[prefix]
+                new_beams[prefix] = (
+                    np.logaddexp(opb, pb),
+                    np.logaddexp(opnb, pnb),
+                )
+            else:
+                new_beams[prefix] = (pb, pnb)
+
+        for prefix, (pb, pnb) in beams.items():
+            p_total = np.logaddexp(pb, pnb)
+
+            # Blank extension
+            _add(prefix, p_total + log_probs[blank, t], NEG_INF)
+
+            # Character extensions
+            for c in range(C):
+                if c == blank:
+                    continue
+                if len(prefix) > 0 and prefix[-1] == c:
+                    # Repeated char: only extend after blank (new char)
+                    _add(prefix + (c,), NEG_INF, pb + log_probs[c, t])
+                    # Collapse (same prefix kept): after non-blank
+                    _add(prefix, NEG_INF, pnb + log_probs[c, t])
+                else:
+                    _add(prefix + (c,), NEG_INF, p_total + log_probs[c, t])
+
+        # Prune to beam_width
+        scored = sorted(
+            new_beams.items(),
+            key=lambda x: np.logaddexp(x[1][0], x[1][1]),
+            reverse=True,
+        )
+        beams = dict(scored[:beam_width])
+
+    best = max(
+        beams.items(), key=lambda x: np.logaddexp(x[1][0], x[1][1])
+    )
+    return list(best[0])
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def str2bool(v):
+    if isinstance(v, bool):
+        return v
+    if v.lower() in ('true', '1', 'yes'):
+        return True
+    if v.lower() in ('false', '0', 'no'):
+        return False
+    raise argparse.ArgumentTypeError(f"Boolean value expected, got '{v}'")
+
+
 def get_parser():
-    parser = argparse.ArgumentParser(description='parameters to train net')
-    parser.add_argument('--img_size', default=[94, 24], help='the image size')
-    parser.add_argument('--test_img_dirs', default="./data/test", help='the test images path')
-    parser.add_argument('--dropout_rate', default=0, help='dropout rate.')
-    parser.add_argument('--lpr_max_len', default=8, help='license plate number max length.')
-    parser.add_argument('--test_batch_size', default=100, help='testing batch size.')
-    parser.add_argument('--phase_train', default=False, type=bool, help='train or test phase flag.')
-    parser.add_argument('--num_workers', default=8, type=int, help='Number of workers used in dataloading')
-    parser.add_argument('--cuda', default=True, type=bool, help='Use cuda to train model')
-    parser.add_argument('--show', default=False, type=bool, help='show test image and its predict result or not.')
-    parser.add_argument('--pretrained_model', default='./weights/Final_LPRNet_model.pth', help='pretrained base model')
+    parser = argparse.ArgumentParser(description='LPRNet Testing')
+    parser.add_argument('--img_size', default=[94, 24])
+    parser.add_argument('--test_img_dirs', default="./data/test")
+    parser.add_argument('--dropout_rate', default=0, type=float)
+    parser.add_argument('--lpr_max_len', default=8, type=int)
+    parser.add_argument('--test_batch_size', default=100, type=int)
+    parser.add_argument('--num_workers', default=0, type=int)
+    parser.add_argument('--cuda', default=True, type=str2bool)
+    parser.add_argument('--show', default=False, type=str2bool,
+                        help='display predictions visually')
+    parser.add_argument('--use_stn', action='store_true',
+                        help='must match training flag')
+    parser.add_argument('--pretrained_model',
+                        default='./weights/Final_LPRNet_model.pth')
+    parser.add_argument('--decode_method', default='greedy',
+                        choices=['greedy', 'beam_search'],
+                        help='CTC decoding strategy (Sec. 3.1)')
+    parser.add_argument('--beam_width', default=10, type=int,
+                        help='beam width for beam_search decode')
+    return parser.parse_args()
 
-    args = parser.parse_args()
 
-    return args
+# ---------------------------------------------------------------------------
+# Evaluation
+# ---------------------------------------------------------------------------
 
 def collate_fn(batch):
     imgs = []
@@ -48,128 +156,119 @@ def collate_fn(batch):
         imgs.append(torch.from_numpy(img))
         labels.extend(label)
         lengths.append(length)
-    labels = np.asarray(labels).flatten().astype(np.float32)
+    labels = np.asarray(labels).flatten().astype(np.int64)
+    return torch.stack(imgs, 0), torch.from_numpy(labels), lengths
 
-    return (torch.stack(imgs, 0), torch.from_numpy(labels), lengths)
 
 def test():
     args = get_parser()
 
-    lprnet = build_lprnet(lpr_max_len=args.lpr_max_len, phase=args.phase_train, class_num=len(CHARS), dropout_rate=args.dropout_rate)
+    lprnet = build_lprnet(
+        class_num=len(CHARS),
+        dropout_rate=args.dropout_rate,
+        use_stn=args.use_stn,
+        training=False,
+    )
     device = torch.device("cuda:0" if args.cuda else "cpu")
     lprnet.to(device)
-    print("Successful to build network!")
+    print("Successfully built LPRNet!")
 
-    # load pretrained model
     if args.pretrained_model:
-        lprnet.load_state_dict(torch.load(args.pretrained_model))
-        print("load pretrained model successful!")
+        lprnet.load_state_dict(
+            torch.load(args.pretrained_model, map_location=device)
+        )
+        print("Loaded pretrained model:", args.pretrained_model)
     else:
-        print("[Error] Can't found pretrained mode, please check!")
-        return False
+        print("[Error] No pretrained model specified!")
+        return
 
     test_img_dirs = os.path.expanduser(args.test_img_dirs)
-    test_dataset = LPRDataLoader(test_img_dirs.split(','), args.img_size, args.lpr_max_len)
+    test_dataset = LPRDataLoader(
+        test_img_dirs.split(','), args.img_size, args.lpr_max_len
+    )
     try:
-        Greedy_Decode_Eval(lprnet, test_dataset, args)
+        evaluate(lprnet, test_dataset, args, device)
     finally:
         cv2.destroyAllWindows()
 
-def Greedy_Decode_Eval(Net, datasets, args):
-    # TestNet = Net.eval()
-    epoch_size = len(datasets) // args.test_batch_size
-    batch_iterator = iter(DataLoader(datasets, args.test_batch_size, shuffle=True, num_workers=args.num_workers, collate_fn=collate_fn))
 
-    Tp = 0
-    Tn_1 = 0
-    Tn_2 = 0
-    t1 = time.time()
-    for i in range(epoch_size):
-        # load train data
-        images, labels, lengths = next(batch_iterator)
-        start = 0
-        targets = []
-        for length in lengths:
-            label = labels[start:start+length]
-            targets.append(label)
-            start += length
-        targets = np.array([el.numpy() for el in targets])
-        imgs = images.numpy().copy()
+def evaluate(net, dataset, args, device):
+    loader = DataLoader(
+        dataset, batch_size=args.test_batch_size, shuffle=True,
+        num_workers=args.num_workers, collate_fn=collate_fn,
+    )
 
-        if args.cuda:
-            images = Variable(images.cuda())
-        else:
-            images = Variable(images)
+    blank = len(CHARS) - 1
+    tp, tn_len, tn_char = 0, 0, 0
+    t_start = time.time()
 
-        # forward
-        prebs = Net(images)
-        # greedy decode
-        prebs = prebs.cpu().detach().numpy()
-        preb_labels = list()
-        for i in range(prebs.shape[0]):
-            preb = prebs[i, :, :]
-            preb_label = list()
-            for j in range(preb.shape[1]):
-                preb_label.append(np.argmax(preb[:, j], axis=0))
-            no_repeat_blank_label = list()
-            pre_c = preb_label[0]
-            if pre_c != len(CHARS) - 1:
-                no_repeat_blank_label.append(pre_c)
-            for c in preb_label: # dropout repeate label and blank label
-                if (pre_c == c) or (c == len(CHARS) - 1):
-                    if c == len(CHARS) - 1:
-                        pre_c = c
-                    continue
-                no_repeat_blank_label.append(c)
-                pre_c = c
-            preb_labels.append(no_repeat_blank_label)
-        for i, label in enumerate(preb_labels):
-            # show image and its predict label
-            if args.show:
-                show(imgs[i], label, targets[i])
-            if len(label) != len(targets[i]):
-                Tn_1 += 1
-                continue
-            if (np.asarray(targets[i]) == np.asarray(label)).all():
-                Tp += 1
-            else:
-                Tn_2 += 1
-    Acc = Tp * 1.0 / (Tp + Tn_1 + Tn_2)
-    print("[Info] Test Accuracy: {} [{}:{}:{}:{}]".format(Acc, Tp, Tn_1, Tn_2, (Tp+Tn_1+Tn_2)))
-    t2 = time.time()
-    print("[Info] Test Speed: {}s 1/{}]".format((t2 - t1) / len(datasets), len(datasets)))
+    with torch.no_grad():
+        for images, labels, lengths in loader:
+            start = 0
+            targets = []
+            for length in lengths:
+                targets.append(labels[start:start + length].numpy())
+                start += length
+
+            imgs_np = images.numpy().copy()
+            images = images.to(device)
+            logits = net(images).cpu().numpy()
+
+            for i in range(logits.shape[0]):
+                pred = logits[i]  # (class_num, T)
+
+                if args.decode_method == 'beam_search':
+                    decoded = beam_search_decode(
+                        pred, beam_width=args.beam_width, blank=blank
+                    )
+                else:
+                    decoded = greedy_decode(pred, blank)
+
+                if args.show:
+                    show(imgs_np[i], decoded, targets[i])
+
+                if len(decoded) != len(targets[i]):
+                    tn_len += 1
+                elif (np.array(decoded) == targets[i]).all():
+                    tp += 1
+                else:
+                    tn_char += 1
+
+    total = tp + tn_len + tn_char
+    acc = tp / total if total > 0 else 0
+    elapsed = time.time() - t_start
+    print(
+        f"[Test] Accuracy: {acc:.4f} "
+        f"[{tp}:{tn_len}:{tn_char}:{total}]"
+    )
+    print(
+        f"[Test] Speed: {elapsed / max(len(dataset), 1):.4f}s/img "
+        f"({len(dataset)} images)"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Visualisation helpers
+# ---------------------------------------------------------------------------
 
 def show(img, label, target):
     img = np.transpose(img, (1, 2, 0))
-    img *= 128.
+    img *= 128.0
     img += 127.5
     img = img.astype(np.uint8)
 
-    lb = ""
-    for i in label:
-        lb += CHARS[i]
-    tg = ""
-    for j in target.tolist():
-        tg += CHARS[int(j)]
+    lb = "".join(CHARS[i] for i in label)
+    tg = "".join(CHARS[int(j)] for j in target)
 
-    flag = "F"
-    if lb == tg:
-        flag = "T"
-    # img = cv2.putText(img, lb, (0,16), cv2.FONT_HERSHEY_COMPLEX_SMALL, 0.6, (0, 0, 255), 1)
-    img = cv2ImgAddText(img, lb, (0, 0))
+    flag = "T" if lb == tg else "F"
+    img = cv2.resize(img, (img.shape[1] * 3, img.shape[0] * 3),
+                     interpolation=cv2.INTER_NEAREST)
+    cv2.putText(img, lb, (2, 14), cv2.FONT_HERSHEY_SIMPLEX,
+                0.5, (0, 0, 255), 1, cv2.LINE_AA)
     cv2.imshow("test", img)
-    print("target: ", tg, " ### {} ### ".format(flag), "predict: ", lb)
+    print(f"target: {tg}  ### {flag} ###  predict: {lb}")
     cv2.waitKey()
     cv2.destroyAllWindows()
-
-def cv2ImgAddText(img, text, pos, textColor=(255, 0, 0), textSize=12):
-    if (isinstance(img, np.ndarray)):  # detect opencv format or not
-        img = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
-    draw = ImageDraw.Draw(img)
-    fontText = ImageFont.truetype("data/NotoSansCJK-Regular.ttc", textSize, encoding="utf-8")
-    draw.text(pos, text, textColor, font=fontText)
-
-    return cv2.cvtColor(np.asarray(img), cv2.COLOR_RGB2BGR)
 
 
 if __name__ == "__main__":
