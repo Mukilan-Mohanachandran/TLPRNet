@@ -73,6 +73,15 @@ def get_parser():
                         help='enable Spatial Transformer Network')
     parser.add_argument('--stn_warmup', default=5000, type=int,
                         help='iterations before enabling STN (paper: 5k)')
+    parser.add_argument('--backbone_type', default='lprnet',
+                        choices=['lprnet', 'svtr_lcnet'],
+                        help='recognizer backbone variant')
+    parser.add_argument('--mix_dim', default=192, type=int,
+                        help='hybrid backbone token/channel dimension')
+    parser.add_argument('--mix_blocks', default=2, type=int,
+                        help='number of global mix blocks for hybrid backbone')
+    parser.add_argument('--mix_heads', default=4, type=int,
+                        help='attention heads in each global mix block')
     parser.add_argument('--augment', action='store_true',
                         help='enable random affine augmentation (paper: yes)')
     parser.add_argument('--cuda', default=True, type=str2bool)
@@ -97,6 +106,10 @@ def train():
         dropout_rate=args.dropout_rate,
         use_stn=args.use_stn,
         training=True,
+        backbone_type=args.backbone_type,
+        mix_dim=args.mix_dim,
+        mix_blocks=args.mix_blocks,
+        mix_heads=args.mix_heads,
     )
     device = torch.device("cuda:0" if args.cuda else "cpu")
     lprnet.to(device)

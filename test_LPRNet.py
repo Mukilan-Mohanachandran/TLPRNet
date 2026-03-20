@@ -133,6 +133,15 @@ def get_parser():
                         help='display predictions visually')
     parser.add_argument('--use_stn', action='store_true',
                         help='must match training flag')
+    parser.add_argument('--backbone_type', default='lprnet',
+                        choices=['lprnet', 'svtr_lcnet'],
+                        help='must match training backbone')
+    parser.add_argument('--mix_dim', default=192, type=int,
+                        help='hybrid backbone token/channel dimension')
+    parser.add_argument('--mix_blocks', default=2, type=int,
+                        help='number of global mix blocks for hybrid backbone')
+    parser.add_argument('--mix_heads', default=4, type=int,
+                        help='attention heads in each global mix block')
     parser.add_argument('--pretrained_model',
                         default='./weights/Final_LPRNet_model.pth')
     parser.add_argument('--decode_method', default='greedy',
@@ -168,6 +177,10 @@ def test():
         dropout_rate=args.dropout_rate,
         use_stn=args.use_stn,
         training=False,
+        backbone_type=args.backbone_type,
+        mix_dim=args.mix_dim,
+        mix_blocks=args.mix_blocks,
+        mix_heads=args.mix_heads,
     )
     device = torch.device("cuda:0" if args.cuda else "cpu")
     lprnet.to(device)

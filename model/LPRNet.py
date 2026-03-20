@@ -3,6 +3,59 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+class LCNetBlock(nn.Module):
+    """Depthwise-separable block used for lightweight local feature extraction."""
+
+    def __init__(self, ch_in, ch_out, stride=(1, 1)):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Conv2d(
+                ch_in, ch_in, kernel_size=3, stride=stride, padding=1,
+                groups=ch_in, bias=False
+            ),
+            nn.BatchNorm2d(ch_in),
+            nn.Hardswish(),
+            nn.Conv2d(ch_in, ch_out, kernel_size=1, bias=False),
+            nn.BatchNorm2d(ch_out),
+            nn.Hardswish(),
+        )
+
+    def forward(self, x):
+        return self.block(x)
+
+
+class SVTRMixBlock(nn.Module):
+    """Minimal global-mixing block over flattened spatial tokens."""
+
+    def __init__(self, dim, num_heads=4, mlp_ratio=2.0, dropout=0.1):
+        super().__init__()
+        hidden_dim = int(dim * mlp_ratio)
+        self.norm1 = nn.LayerNorm(dim)
+        self.attn = nn.MultiheadAttention(
+            embed_dim=dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.norm2 = nn.LayerNorm(dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, dim),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x):
+        # x: (N, C, H, W) -> tokens: (N, H*W, C)
+        n, c, h, w = x.shape
+        tokens = x.flatten(2).transpose(1, 2)
+        attn_out, _ = self.attn(self.norm1(tokens), self.norm1(tokens), self.norm1(tokens))
+        tokens = tokens + attn_out
+        tokens = tokens + self.mlp(self.norm2(tokens))
+        return tokens.transpose(1, 2).reshape(n, c, h, w)
+
+
 class SmallBasicBlock(nn.Module):
     """Paper Table 2: Lightweight building block inspired by SqueezeNet Fire
     and Inception blocks. BN + ReLU applied after each convolution (Sec. 3.1).
@@ -68,37 +121,12 @@ class LocNet(nn.Module):
         return F.grid_sample(x, grid, align_corners=True)
 
 
-class LPRNet(nn.Module):
-    """LPRNet: License Plate Recognition via Deep Neural Networks.
+class LPRNetBackbone(nn.Module):
+    """Original LPRNet paper-faithful backbone."""
 
-    Architecture from arXiv:1806.10447, Section 3.1:
-      - Optional STN alignment via LocNet (Table 1)
-      - Lightweight CNN backbone (Table 3) with SmallBasicBlocks (Table 2)
-      - Global context embedding (ParseNet-style, ref [12])
-      - Per-position classification head for CTC decoding
-
-    MaxPool3d is used to simultaneously pool across the channel dimension
-    and spatial dimensions, matching the paper's Table 3 channel counts.
-
-    Input:  (N, 3, 24, 94) — 94x24 RGB license plate image
-    Output: (N, class_num, T) — per-position class logits (T ≈ 74)
-    """
-
-    def __init__(self, class_num, dropout_rate=0.5, use_stn=False):
+    def __init__(self, class_num, dropout_rate):
         super().__init__()
-        self.class_num = class_num
-        self.use_stn = use_stn
-        self.stn_enabled = use_stn
-
-        if use_stn:
-            self.stn = LocNet()
-
-        # Paper Table 3 — Backbone Network
-        # MaxPool3d on 4D Conv2d output: (N, C, H, W) is treated as
-        # unbatched (C_pool=N, D=C_conv, H, W); stride order is (D, H, W).
-        # Paper stride (2,1) means H_stride=2, W_stride=1; D_stride is set
-        # to produce 64 output channels from the preceding layer's channel count.
-        self.backbone = nn.Sequential(
+        self.net = nn.Sequential(
             nn.Conv2d(3, 64, kernel_size=3, stride=1),                       # Conv #64
             nn.BatchNorm2d(64),
             nn.ReLU(),
@@ -115,6 +143,98 @@ class LPRNet(nn.Module):
             nn.Dropout(dropout_rate),
             nn.Conv2d(256, class_num, kernel_size=(1, 13), stride=1),        # Conv #class 1x13
         )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class HybridSVTRLCNetBackbone(nn.Module):
+    """Incremental hybrid backbone: LCNet stem + lightweight SVTR mixing."""
+
+    def __init__(self, class_num, dropout_rate, mix_dim=192, mix_blocks=2, mix_heads=4):
+        super().__init__()
+        if mix_dim % mix_heads != 0:
+            raise ValueError("mix_dim must be divisible by mix_heads")
+        if mix_blocks < 1:
+            raise ValueError("mix_blocks must be >= 1")
+
+        self.stem = nn.Sequential(
+            nn.Conv2d(3, 32, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(32),
+            nn.Hardswish(),
+            LCNetBlock(32, 64, stride=(2, 1)),   # 24x94 -> 12x94
+            LCNetBlock(64, 128, stride=(2, 1)),  # 12x94 -> 6x94
+            LCNetBlock(128, 192, stride=(2, 2)), # 6x94 -> 3x47
+            nn.Conv2d(192, mix_dim, kernel_size=1, bias=False),
+            nn.BatchNorm2d(mix_dim),
+            nn.Hardswish(),
+        )
+        self.mix_blocks = nn.Sequential(
+            *[SVTRMixBlock(mix_dim, num_heads=mix_heads, dropout=dropout_rate * 0.2)
+              for _ in range(mix_blocks)]
+        )
+        self.head = nn.Sequential(
+            nn.Conv2d(mix_dim, 256, kernel_size=(3, 1), stride=1),  # 3x47 -> 1x47
+            nn.BatchNorm2d(256),
+            nn.Hardswish(),
+            nn.Dropout(dropout_rate),
+            nn.Conv2d(256, class_num, kernel_size=(1, 5), stride=1, padding=(0, 2)),
+        )
+
+    def forward(self, x):
+        x = self.stem(x)
+        x = self.mix_blocks(x)
+        x = self.head(x)
+        return x
+
+
+class LPRNet(nn.Module):
+    """LPRNet: License Plate Recognition via Deep Neural Networks.
+
+    Architecture from arXiv:1806.10447, Section 3.1:
+      - Optional STN alignment via LocNet (Table 1)
+      - Lightweight CNN backbone (Table 3) with SmallBasicBlocks (Table 2)
+      - Global context embedding (ParseNet-style, ref [12])
+      - Per-position classification head for CTC decoding
+
+    MaxPool3d is used to simultaneously pool across the channel dimension
+    and spatial dimensions, matching the paper's Table 3 channel counts.
+
+    Input:  (N, 3, 24, 94) — 94x24 RGB license plate image
+    Output: (N, class_num, T) — per-position class logits (T ≈ 74)
+    """
+
+    def __init__(
+        self,
+        class_num,
+        dropout_rate=0.5,
+        use_stn=False,
+        backbone_type="lprnet",
+        mix_dim=192,
+        mix_blocks=2,
+        mix_heads=4,
+    ):
+        super().__init__()
+        self.class_num = class_num
+        self.use_stn = use_stn
+        self.stn_enabled = use_stn
+        self.backbone_type = backbone_type
+
+        if use_stn:
+            self.stn = LocNet()
+
+        if backbone_type == "lprnet":
+            self.backbone = LPRNetBackbone(class_num, dropout_rate)
+        elif backbone_type == "svtr_lcnet":
+            self.backbone = HybridSVTRLCNetBackbone(
+                class_num=class_num,
+                dropout_rate=dropout_rate,
+                mix_dim=mix_dim,
+                mix_blocks=mix_blocks,
+                mix_heads=mix_heads,
+            )
+        else:
+            raise ValueError(f"Unsupported backbone_type: {backbone_type}")
 
         # Global context embedding (Sec. 3.1, ref [12] ParseNet):
         # FC over backbone output → tile → concat → 1x1 conv
@@ -139,7 +259,24 @@ class LPRNet(nn.Module):
         return logits
 
 
-def build_lprnet(class_num=66, dropout_rate=0.5, use_stn=False, training=True):
+def build_lprnet(
+    class_num=66,
+    dropout_rate=0.5,
+    use_stn=False,
+    training=True,
+    backbone_type="lprnet",
+    mix_dim=192,
+    mix_blocks=2,
+    mix_heads=4,
+):
     """Factory helper matching the paper's default configuration."""
-    net = LPRNet(class_num, dropout_rate, use_stn)
+    net = LPRNet(
+        class_num=class_num,
+        dropout_rate=dropout_rate,
+        use_stn=use_stn,
+        backbone_type=backbone_type,
+        mix_dim=mix_dim,
+        mix_blocks=mix_blocks,
+        mix_heads=mix_heads,
+    )
     return net.train() if training else net.eval()

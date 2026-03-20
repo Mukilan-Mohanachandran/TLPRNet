@@ -84,6 +84,22 @@ python train_LPRNet.py \
     --augment
 ```
 
+### Train with hybrid SVTR-LCNet-style backbone
+
+```bash
+python train_LPRNet.py \
+    --train_img_dirs data/train \
+    --test_img_dirs data/train \
+    --lpr_max_len 10 \
+    --batch_size 16 \
+    --max_iter 5000 \
+    --backbone_type svtr_lcnet \
+    --mix_dim 192 \
+    --mix_blocks 2 \
+    --mix_heads 4 \
+    --augment
+```
+
 ### Full flag reference
 
 | Flag | Default | Description |
@@ -102,6 +118,10 @@ python train_LPRNet.py \
 | `--augment` | off | Enable random affine augmentation |
 | `--use_stn` | off | Enable Spatial Transformer Network |
 | `--stn_warmup` | `5000` | Iterations before activating STN |
+| `--backbone_type` | `lprnet` | Backbone: `lprnet` (baseline) or `svtr_lcnet` (hybrid) |
+| `--mix_dim` | `192` | Hybrid token/channel dimension (used when `svtr_lcnet`) |
+| `--mix_blocks` | `2` | Number of lightweight global-mix blocks (hybrid only) |
+| `--mix_heads` | `4` | Attention heads per mix block (hybrid only) |
 | `--cuda` | `True` | Use GPU (set `False` for CPU) |
 | `--resume_iter` | `0` | Resume training from this iteration |
 | `--pretrained_model` | `""` | Path to pretrained `.pth` weights |
@@ -173,6 +193,20 @@ python test_LPRNet.py \
     --beam_width 10
 ```
 
+### Test with hybrid backbone
+
+```bash
+python test_LPRNet.py \
+    --test_img_dirs data/train \
+    --lpr_max_len 10 \
+    --pretrained_model ./weights/Final_LPRNet_model.pth \
+    --backbone_type svtr_lcnet \
+    --mix_dim 192 \
+    --mix_blocks 2 \
+    --mix_heads 4 \
+    --decode_method greedy
+```
+
 ### Show predictions visually
 
 ```bash
@@ -192,6 +226,10 @@ python test_LPRNet.py \
 | `--beam_width` | `10` | Beam width (only for beam_search) |
 | `--show` | `False` | Display each prediction in a window |
 | `--use_stn` | off | Must match training flag |
+| `--backbone_type` | `lprnet` | Must match training backbone (`lprnet` or `svtr_lcnet`) |
+| `--mix_dim` | `192` | Must match hybrid training config |
+| `--mix_blocks` | `2` | Must match hybrid training config |
+| `--mix_heads` | `4` | Must match hybrid training config |
 | `--dropout_rate` | `0` | Keep at 0 for inference |
 | `--cuda` | `True` | GPU / CPU toggle |
 
