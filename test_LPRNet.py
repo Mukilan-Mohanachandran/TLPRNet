@@ -152,6 +152,54 @@ def get_parser():
     return parser.parse_args()
 
 
+def _unwrap_checkpoint_state_dict(checkpoint):
+    """Return a plain state_dict from either raw or wrapped checkpoints."""
+    if isinstance(checkpoint, dict):
+        for key in ("state_dict", "model_state_dict", "model"):
+            if key in checkpoint and isinstance(checkpoint[key], dict):
+                return checkpoint[key]
+    return checkpoint
+
+
+def _infer_backbone_type(state_dict):
+    keys = state_dict.keys()
+    if any(k.startswith("backbone.stem.") or k.startswith("backbone.mix_blocks.") or
+           k.startswith("backbone.head.") for k in keys):
+        return "svtr_lcnet"
+    if any(k.startswith("backbone.net.") for k in keys):
+        return "lprnet"
+    return None
+
+
+def _infer_hybrid_config(state_dict):
+    mix_dim = None
+    stem_proj = state_dict.get("backbone.stem.6.weight")
+    if stem_proj is not None and hasattr(stem_proj, "shape") and len(stem_proj.shape) >= 1:
+        mix_dim = int(stem_proj.shape[0])
+
+    block_ids = set()
+    for key in state_dict.keys():
+        if key.startswith("backbone.mix_blocks."):
+            parts = key.split(".")
+            if len(parts) > 2 and parts[2].isdigit():
+                block_ids.add(int(parts[2]))
+    mix_blocks = (max(block_ids) + 1) if block_ids else None
+    return mix_dim, mix_blocks
+
+
+def _build_model_from_args(args, backbone_type=None, use_stn=None, mix_dim=None, mix_blocks=None):
+    return build_lprnet(
+        class_num=len(CHARS),
+        dropout_rate=args.dropout_rate,
+        use_stn=args.use_stn if use_stn is None else use_stn,
+        training=False,
+        backbone_type=args.backbone_type if backbone_type is None else backbone_type,
+        mix_dim=args.mix_dim if mix_dim is None else mix_dim,
+        mix_blocks=args.mix_blocks if mix_blocks is None else mix_blocks,
+        mix_heads=args.mix_heads,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Evaluation
 # ---------------------------------------------------------------------------
@@ -172,24 +220,56 @@ def collate_fn(batch):
 def test():
     args = get_parser()
 
-    lprnet = build_lprnet(
-        class_num=len(CHARS),
-        dropout_rate=args.dropout_rate,
-        use_stn=args.use_stn,
-        training=False,
-        backbone_type=args.backbone_type,
-        mix_dim=args.mix_dim,
-        mix_blocks=args.mix_blocks,
-        mix_heads=args.mix_heads,
-    )
     device = torch.device("cuda:0" if args.cuda else "cpu")
-    lprnet.to(device)
-    print("Successfully built LPRNet!")
 
     if args.pretrained_model:
-        lprnet.load_state_dict(
-            torch.load(args.pretrained_model, map_location=device)
+        checkpoint = torch.load(args.pretrained_model, map_location=device)
+        state_dict = _unwrap_checkpoint_state_dict(checkpoint)
+        if not isinstance(state_dict, dict):
+            print(f"[Error] Unsupported checkpoint format: {type(state_dict)}")
+            return
+
+        inferred_backbone = _infer_backbone_type(state_dict)
+        inferred_use_stn = any(k.startswith("stn.") for k in state_dict.keys())
+        inferred_mix_dim, inferred_mix_blocks = _infer_hybrid_config(state_dict)
+
+        needs_rebuild = (
+            (inferred_backbone is not None and inferred_backbone != args.backbone_type)
+            or (inferred_use_stn != args.use_stn)
+            or (inferred_backbone == "svtr_lcnet" and inferred_mix_dim is not None and inferred_mix_dim != args.mix_dim)
+            or (inferred_backbone == "svtr_lcnet" and inferred_mix_blocks is not None and inferred_mix_blocks != args.mix_blocks)
         )
+
+        if needs_rebuild:
+            print("[Info] Checkpoint config differs from CLI flags. Auto-adjusting model config:")
+            print(f"       backbone_type: {args.backbone_type} -> {inferred_backbone or args.backbone_type}")
+            print(f"       use_stn:       {args.use_stn} -> {inferred_use_stn}")
+            if inferred_backbone == "svtr_lcnet":
+                if inferred_mix_dim is not None and inferred_mix_dim != args.mix_dim:
+                    print(f"       mix_dim:       {args.mix_dim} -> {inferred_mix_dim}")
+                if inferred_mix_blocks is not None and inferred_mix_blocks != args.mix_blocks:
+                    print(f"       mix_blocks:    {args.mix_blocks} -> {inferred_mix_blocks}")
+            lprnet = _build_model_from_args(
+                args,
+                backbone_type=inferred_backbone or args.backbone_type,
+                use_stn=inferred_use_stn,
+                mix_dim=inferred_mix_dim,
+                mix_blocks=inferred_mix_blocks,
+            )
+        else:
+            lprnet = _build_model_from_args(args)
+
+        lprnet.to(device)
+        print("Successfully built LPRNet!")
+        try:
+            lprnet.load_state_dict(state_dict)
+        except RuntimeError as exc:
+            print("[Error] Failed to load checkpoint. Likely model/checkpoint config mismatch.")
+            print("Try explicitly passing matching flags:")
+            print("  --backbone_type {lprnet|svtr_lcnet} --use_stn")
+            print("  --mix_dim N --mix_blocks N --mix_heads N   (for svtr_lcnet)")
+            print(f"Raw error: {exc}")
+            return
         print("Loaded pretrained model:", args.pretrained_model)
     else:
         print("[Error] No pretrained model specified!")
